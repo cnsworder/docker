@@ -1,8 +1,9 @@
 package registry
 
 import (
-	"github.com/dotcloud/docker/auth"
+	"fmt"
 	"github.com/dotcloud/docker/utils"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -14,7 +15,7 @@ var (
 )
 
 func spawnTestRegistry(t *testing.T) *Registry {
-	authConfig := &auth.AuthConfig{}
+	authConfig := &AuthConfig{}
 	r, err := NewRegistry(authConfig, utils.NewHTTPRequestFactory(), makeURL("/v1/"))
 	if err != nil {
 		t.Fatal(err)
@@ -23,11 +24,11 @@ func spawnTestRegistry(t *testing.T) *Registry {
 }
 
 func TestPingRegistryEndpoint(t *testing.T) {
-	standalone, err := pingRegistryEndpoint(makeURL("/v1/"))
+	regInfo, err := pingRegistryEndpoint(makeURL("/v1/"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertEqual(t, standalone, true, "Expected standalone to be true (default)")
+	assertEqual(t, regInfo.Standalone, true, "Expected standalone to be true (default)")
 }
 
 func TestGetRemoteHistory(t *testing.T) {
@@ -69,7 +70,7 @@ func TestGetRemoteImageJSON(t *testing.T) {
 
 func TestGetRemoteImageLayer(t *testing.T) {
 	r := spawnTestRegistry(t)
-	data, err := r.GetRemoteImageLayer(IMAGE_ID, makeURL("/v1/"), TOKEN)
+	data, err := r.GetRemoteImageLayer(IMAGE_ID, makeURL("/v1/"), TOKEN, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +78,7 @@ func TestGetRemoteImageLayer(t *testing.T) {
 		t.Fatal("Expected non-nil data result")
 	}
 
-	_, err = r.GetRemoteImageLayer("abcdef", makeURL("/v1/"), TOKEN)
+	_, err = r.GetRemoteImageLayer("abcdef", makeURL("/v1/"), TOKEN, 0)
 	if err == nil {
 		t.Fatal("Expected image not found error")
 	}
@@ -100,12 +101,23 @@ func TestGetRemoteTags(t *testing.T) {
 
 func TestGetRepositoryData(t *testing.T) {
 	r := spawnTestRegistry(t)
+	parsedUrl, err := url.Parse(makeURL("/v1/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := "http://" + parsedUrl.Host + "/v1/"
 	data, err := r.GetRepositoryData("foo42/bar")
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertEqual(t, len(data.ImgList), 2, "Expected 2 images in ImgList")
-	assertEqual(t, len(data.Endpoints), 1, "Expected one endpoint in Endpoints")
+	assertEqual(t, len(data.Endpoints), 2,
+		fmt.Sprintf("Expected 2 endpoints in Endpoints, found %d instead", len(data.Endpoints)))
+	assertEqual(t, data.Endpoints[0], host,
+		fmt.Sprintf("Expected first endpoint to be %s but found %s instead", host, data.Endpoints[0]))
+	assertEqual(t, data.Endpoints[1], "http://test.example.com/v1/",
+		fmt.Sprintf("Expected first endpoint to be http://test.example.com/v1/ but found %s instead", data.Endpoints[1]))
+
 }
 
 func TestPushImageJSONRegistry(t *testing.T) {
@@ -124,7 +136,7 @@ func TestPushImageJSONRegistry(t *testing.T) {
 func TestPushImageLayerRegistry(t *testing.T) {
 	r := spawnTestRegistry(t)
 	layer := strings.NewReader("")
-	_, err := r.PushImageLayerRegistry(IMAGE_ID, layer, makeURL("/v1/"), TOKEN, []byte{})
+	_, _, err := r.PushImageLayerRegistry(IMAGE_ID, layer, makeURL("/v1/"), TOKEN, []byte{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +149,7 @@ func TestResolveRepositoryName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertEqual(t, ep, auth.IndexServerAddress(), "Expected endpoint to be index server address")
+	assertEqual(t, ep, IndexServerAddress(), "Expected endpoint to be index server address")
 	assertEqual(t, repo, "fooo/bar", "Expected resolved repo to be foo/bar")
 
 	u := makeURL("")[7:]
@@ -145,8 +157,15 @@ func TestResolveRepositoryName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertEqual(t, ep, "http://"+u+"/v1/", "Expected endpoint to be "+u)
+	assertEqual(t, ep, u, "Expected endpoint to be "+u)
 	assertEqual(t, repo, "private/moonbase", "Expected endpoint to be private/moonbase")
+
+	ep, repo, err = ResolveRepositoryName("ubuntu-12.04-base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEqual(t, ep, IndexServerAddress(), "Expected endpoint to be "+IndexServerAddress())
+	assertEqual(t, repo, "ubuntu-12.04-base", "Expected endpoint to be ubuntu-12.04-base")
 }
 
 func TestPushRegistryTag(t *testing.T) {
@@ -187,14 +206,16 @@ func TestPushImageJSONIndex(t *testing.T) {
 
 func TestSearchRepositories(t *testing.T) {
 	r := spawnTestRegistry(t)
-	results, err := r.SearchRepositories("supercalifragilisticepsialidocious")
+	results, err := r.SearchRepositories("fakequery")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if results == nil {
 		t.Fatal("Expected non-nil SearchResults object")
 	}
-	assertEqual(t, results.NumResults, 0, "Expected 0 search results")
+	assertEqual(t, results.NumResults, 1, "Expected 1 search results")
+	assertEqual(t, results.Query, "fakequery", "Expected 'fakequery' as query")
+	assertEqual(t, results.Results[0].StarCount, 42, "Expected 'fakeimage' a ot hae 42 stars")
 }
 
 func TestValidRepositoryName(t *testing.T) {
@@ -202,6 +223,10 @@ func TestValidRepositoryName(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := validateRepositoryName("docker/Docker"); err == nil {
+		t.Log("Repository name should be invalid")
+		t.Fail()
+	}
+	if err := validateRepositoryName("docker///docker"); err == nil {
 		t.Log("Repository name should be invalid")
 		t.Fail()
 	}

@@ -39,7 +39,7 @@ arch-chroot $ROOTFS /bin/sh -c "haveged -w 1024; pacman-key --init; pkill havege
 arch-chroot $ROOTFS /bin/sh -c "ln -s /usr/share/zoneinfo/UTC /etc/localtime"
 echo 'en_US.UTF-8 UTF-8' > $ROOTFS/etc/locale.gen
 arch-chroot $ROOTFS locale-gen
-arch-chroot $ROOTFS /bin/sh -c 'echo "Server = http://mirrors.kernel.org/archlinux/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist'
+arch-chroot $ROOTFS /bin/sh -c 'echo "Server = https://mirrors.kernel.org/archlinux/\$repo/os/\$arch" > /etc/pacman.d/mirrorlist'
 
 # udev doesn't work in containers, rebuild /dev
 DEV=$ROOTFS/dev
@@ -57,6 +57,7 @@ mknod -m 666 $DEV/tty0 c 4 0
 mknod -m 666 $DEV/full c 1 7
 mknod -m 600 $DEV/initctl p
 mknod -m 666 $DEV/ptmx c 5 2
+ln -sf /proc/self/fd $DEV/fd
 
 tar --numeric-owner -C $ROOTFS -c . | docker import - archlinux
 docker run -i -t archlinux echo Success.

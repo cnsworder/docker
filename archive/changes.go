@@ -1,15 +1,18 @@
 package archive
 
 import (
-	"archive/tar"
+	"bytes"
 	"fmt"
-	"github.com/dotcloud/docker/utils"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/dotcloud/docker/pkg/system"
+	"github.com/dotcloud/docker/utils"
+	"github.com/dotcloud/docker/vendor/src/code.google.com/p/go/src/pkg/archive/tar"
 )
 
 type ChangeType int
@@ -126,10 +129,11 @@ func Changes(layers []string, rw string) ([]Change, error) {
 }
 
 type FileInfo struct {
-	parent   *FileInfo
-	name     string
-	stat     syscall.Stat_t
-	children map[string]*FileInfo
+	parent     *FileInfo
+	name       string
+	stat       syscall.Stat_t
+	children   map[string]*FileInfo
+	capability []byte
 }
 
 func (root *FileInfo) LookUp(path string) *FileInfo {
@@ -200,7 +204,8 @@ func (info *FileInfo) addChanges(oldInfo *FileInfo, changes *[]Change) {
 				oldStat.Rdev != newStat.Rdev ||
 				// Don't look at size for dirs, its not a good measure of change
 				(oldStat.Size != newStat.Size && oldStat.Mode&syscall.S_IFDIR != syscall.S_IFDIR) ||
-				!sameFsTimeSpec(getLastModification(oldStat), getLastModification(newStat)) {
+				!sameFsTimeSpec(system.GetLastModification(oldStat), system.GetLastModification(newStat)) ||
+				bytes.Compare(oldChild.capability, newChild.capability) != 0 {
 				change := Change{
 					Path: newChild.path(),
 					Kind: ChangeModify,
@@ -275,6 +280,8 @@ func collectFileInfo(sourceDir string) (*FileInfo, error) {
 			return err
 		}
 
+		info.capability, _ = system.Lgetxattr(path, "security.capability")
+
 		parent.children[info.name] = info
 
 		return nil
@@ -287,13 +294,23 @@ func collectFileInfo(sourceDir string) (*FileInfo, error) {
 
 // Compare two directories and generate an array of Change objects describing the changes
 func ChangesDirs(newDir, oldDir string) ([]Change, error) {
-	oldRoot, err := collectFileInfo(oldDir)
-	if err != nil {
-		return nil, err
-	}
-	newRoot, err := collectFileInfo(newDir)
-	if err != nil {
-		return nil, err
+	var (
+		oldRoot, newRoot *FileInfo
+		err1, err2       error
+		errs             = make(chan error, 2)
+	)
+	go func() {
+		oldRoot, err1 = collectFileInfo(oldDir)
+		errs <- err1
+	}()
+	go func() {
+		newRoot, err2 = collectFileInfo(newDir)
+		errs <- err2
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			return nil, err
+		}
 	}
 
 	return newRoot.Changes(oldRoot), nil
@@ -335,12 +352,13 @@ func ExportChanges(dir string, changes []Change) (Archive, error) {
 				whiteOutDir := filepath.Dir(change.Path)
 				whiteOutBase := filepath.Base(change.Path)
 				whiteOut := filepath.Join(whiteOutDir, ".wh."+whiteOutBase)
+				timestamp := time.Now()
 				hdr := &tar.Header{
 					Name:       whiteOut[1:],
 					Size:       0,
-					ModTime:    time.Now(),
-					AccessTime: time.Now(),
-					ChangeTime: time.Now(),
+					ModTime:    timestamp,
+					AccessTime: timestamp,
+					ChangeTime: timestamp,
 				}
 				if err := tw.WriteHeader(hdr); err != nil {
 					utils.Debugf("Can't write whiteout header: %s\n", err)

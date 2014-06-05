@@ -3,10 +3,12 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/dotcloud/docker/pkg/term"
 	"io"
 	"strings"
 	"time"
+
+	"github.com/dotcloud/docker/pkg/term"
+	"github.com/dotcloud/docker/pkg/units"
 )
 
 type JSONError struct {
@@ -41,18 +43,18 @@ func (p *JSONProgress) String() string {
 	if p.Current <= 0 && p.Total <= 0 {
 		return ""
 	}
-	current := HumanSize(int64(p.Current))
+	current := units.HumanSize(int64(p.Current))
 	if p.Total <= 0 {
 		return fmt.Sprintf("%8v", current)
 	}
-	total := HumanSize(int64(p.Total))
+	total := units.HumanSize(int64(p.Total))
 	percentage := int(float64(p.Current)/float64(p.Total)*100) / 2
 	if width > 110 {
 		pbBox = fmt.Sprintf("[%s>%s] ", strings.Repeat("=", percentage), strings.Repeat(" ", 50-percentage))
 	}
 	numbersBox = fmt.Sprintf("%8v/%v", current, total)
 
-	if p.Start > 0 && percentage < 50 {
+	if p.Current > 0 && p.Start > 0 && percentage < 50 {
 		fromStart := time.Now().UTC().Sub(time.Unix(int64(p.Start), 0))
 		perEntry := fromStart / time.Duration(p.Current)
 		left := time.Duration(p.Total-p.Current) * perEntry
@@ -85,7 +87,7 @@ func (jm *JSONMessage) Display(out io.Writer, isTerminal bool) error {
 		return jm.Error
 	}
 	var endl string
-	if isTerminal {
+	if isTerminal && jm.Stream == "" {
 		// <ESC>[2K = erase entire current line
 		fmt.Fprintf(out, "%c[2K\r", 27)
 		endl = "\r"
@@ -131,7 +133,7 @@ func DisplayJSONMessagesStream(in io.Reader, out io.Writer, terminalFd uintptr, 
 		if jm.Progress != nil {
 			jm.Progress.terminalFd = terminalFd
 		}
-		if jm.Progress != nil || jm.ProgressMessage != "" {
+		if jm.ID != "" && (jm.Progress != nil || jm.ProgressMessage != "") {
 			line, ok := ids[jm.ID]
 			if !ok {
 				line = len(ids)
@@ -141,17 +143,15 @@ func DisplayJSONMessagesStream(in io.Reader, out io.Writer, terminalFd uintptr, 
 			} else {
 				diff = len(ids) - line
 			}
-			if isTerminal {
+			if jm.ID != "" && isTerminal {
 				// <ESC>[{diff}A = move cursor up diff rows
 				fmt.Fprintf(out, "%c[%dA", 27, diff)
 			}
 		}
 		err := jm.Display(out, isTerminal)
-		if jm.ID != "" {
-			if isTerminal {
-				// <ESC>[{diff}B = move cursor down diff rows
-				fmt.Fprintf(out, "%c[%dB", 27, diff)
-			}
+		if jm.ID != "" && isTerminal {
+			// <ESC>[{diff}B = move cursor down diff rows
+			fmt.Fprintf(out, "%c[%dB", 27, diff)
 		}
 		if err != nil {
 			return err

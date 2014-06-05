@@ -1,7 +1,6 @@
 package archive
 
 import (
-	"archive/tar"
 	"bytes"
 	"fmt"
 	"io"
@@ -11,6 +10,8 @@ import (
 	"path"
 	"testing"
 	"time"
+
+	"github.com/dotcloud/docker/vendor/src/code.google.com/p/go/src/pkg/archive/tar"
 )
 
 func TestCmdStreamLargeStderr(t *testing.T) {
@@ -67,12 +68,13 @@ func tarUntar(t *testing.T, origin string, compression Compression) error {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer archive.Close()
 
 	buf := make([]byte, 10)
 	if _, err := archive.Read(buf); err != nil {
 		return err
 	}
-	archive = io.MultiReader(bytes.NewReader(buf), archive)
+	wrap := io.MultiReader(bytes.NewReader(buf), archive)
 
 	detectedCompression := DetectCompression(buf)
 	if detectedCompression.Extension() != compression.Extension() {
@@ -84,7 +86,7 @@ func tarUntar(t *testing.T, origin string, compression Compression) error {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	if err := Untar(archive, tmp, nil); err != nil {
+	if err := Untar(wrap, tmp, nil); err != nil {
 		return err
 	}
 	if _, err := os.Stat(tmp); err != nil {
@@ -131,8 +133,37 @@ func TestTarUntar(t *testing.T) {
 // Failing prevents the archives from being uncompressed during ADD
 func TestTypeXGlobalHeaderDoesNotFail(t *testing.T) {
 	hdr := tar.Header{Typeflag: tar.TypeXGlobalHeader}
-	err := createTarFile("pax_global_header", "some_dir", &hdr, nil)
+	err := createTarFile("pax_global_header", "some_dir", &hdr, nil, true)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Some tar have both GNU specific (huge uid) and Ustar specific (long name) things.
+// Not supposed to happen (should use PAX instead of Ustar for long name) but it does and it should still work.
+func TestUntarUstarGnuConflict(t *testing.T) {
+	f, err := os.Open("testdata/broken.tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	tr := tar.NewReader(f)
+	// Iterate through the files in the archive.
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			// end of tar archive
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Name == "root/.cpanm/work/1395823785.24209/Plack-1.0030/blib/man3/Plack::Middleware::LighttpdScriptNameFix.3pm" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("%s not found in the archive", "root/.cpanm/work/1395823785.24209/Plack-1.0030/blib/man3/Plack::Middleware::LighttpdScriptNameFix.3pm")
 	}
 }

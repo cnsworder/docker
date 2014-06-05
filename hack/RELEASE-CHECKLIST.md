@@ -6,6 +6,21 @@ So you're in charge of a Docker release? Cool. Here's what to do.
 If your experience deviates from this document, please document the changes
 to keep it up-to-date.
 
+It is important to note that this document assumes that the git remote in your
+repository that corresponds to "https://github.com/dotcloud/docker" is named
+"origin".  If yours is not (for example, if you've chosen to name it "upstream"
+or something similar instead), be sure to adjust the listed snippets for your
+local environment accordingly.  If you are not sure what your upstream remote is
+named, use a command like `git remote -v` to find out.
+
+If you don't have an upstream remote, you can add one easily using something
+like:
+
+```bash
+git remote add origin https://github.com/dotcloud/docker.git
+git remote add YOURUSER git@github.com:YOURUSER/docker.git
+```
+
 ### 1. Pull from master and create a release branch
 
 ```bash
@@ -55,7 +70,7 @@ EXAMPLES:
 
 #### Builder
 
-+ 'docker build -t FOO .' applies the tag FOO to the newly built container
++ 'docker build -t FOO .' applies the tag FOO to the newly built image
 
 #### Remote API
 
@@ -89,8 +104,21 @@ make test
 ### 5. Test the docs
 
 Make sure that your tree includes documentation for any modified or
-new features, syntax or semantic changes. Instructions for building
-the docs are in `docs/README.md`.
+new features, syntax or semantic changes.
+
+To test locally:
+
+```bash
+make docs
+```
+
+To make a shared test at http://beta-docs.docker.io:
+
+(You will need the `awsconfig` file added to the `docs/` dir)
+
+```bash
+make AWS_S3_BUCKET=beta-docs.docker.io docs-release
+```
 
 ### 6. Commit and create a pull request to the "release" branch
 
@@ -124,7 +152,7 @@ docker run \
        -e AWS_ACCESS_KEY \
        -e AWS_SECRET_KEY \
        -e GPG_PASSPHRASE \
-       -i -t -privileged \
+       -i -t --privileged \
        docker \
        hack/release.sh
 ```
@@ -158,12 +186,28 @@ docker run \
        -e AWS_ACCESS_KEY \
        -e AWS_SECRET_KEY \
        -e GPG_PASSPHRASE \
-       -i -t -privileged \
+       -i -t --privileged \
        docker \
        hack/release.sh
 ```
 
-### 9. Apply tag
+### 9. Breakathon
+
+Spend several days along with the community explicitly investing time and
+resources to try and break Docker in every possible way, documenting any
+findings pertinent to the release.  This time should be spent testing and
+finding ways in which the release might have caused various features or upgrade
+environments to have issues, not coding.  During this time, the release is in
+code freeze, and any additional code changes will be pushed out to the next
+release.
+
+It should include various levels of breaking Docker, beyond just using Docker
+by the book.
+
+Any issues found may still remain issues for this release, but they should be
+documented and give appropriate warnings.
+
+### 10. Apply tag
 
 ```bash
 git tag -a $VERSION -m $VERSION bump_$VERSION
@@ -173,18 +217,29 @@ git push origin $VERSION
 It's very important that we don't make the tag until after the official
 release is uploaded to get.docker.io!
 
-### 10. Go to github to merge the `bump_$VERSION` into release
-
-Merging the pull request to the release branch will automatically
-update the documentation on the "latest" revision of the docs. You
-should see the updated docs 5-10 minutes after the merge. The docs
-will appear on http://docs.docker.io/. For more information about
-documentation releases, see `docs/README.md`.
+### 11. Go to github to merge the `bump_$VERSION` branch into release
 
 Don't forget to push that pretty blue button to delete the leftover
 branch afterwards!
 
-### 11. Create a new pull request to merge release back into master
+### 12. Update the docs branch
+
+You will need the `awsconfig` file added to the `docs/` directory to contain the
+s3 credentials for the bucket you are deploying to.
+
+```bash
+git checkout docs
+git fetch
+git reset --hard origin/release
+git push -f origin docs
+make AWS_S3_BUCKET=docs.docker.io docs-release
+```
+
+The docs will appear on http://docs.docker.io/ (though there may be cached
+versions, so its worth checking http://docs.docker.io.s3-website-us-west-2.amazonaws.com/).
+For more information about documentation releases, see `docs/README.md`.
+
+### 13. Create a new pull request to merge release back into master
 
 ```bash
 git checkout master
@@ -202,7 +257,7 @@ echo "https://github.com/dotcloud/docker/compare/master...merge_release_$VERSION
 Again, get two maintainers to validate, then merge, then push that pretty
 blue button to delete your branch.
 
-### 12. Rejoice and Evangelize!
+### 14. Rejoice and Evangelize!
 
 Congratulations! You're done.
 

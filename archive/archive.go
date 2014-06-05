@@ -1,12 +1,12 @@
 package archive
 
 import (
-	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
+	"errors"
 	"fmt"
-	"github.com/dotcloud/docker/utils"
 	"io"
 	"io/ioutil"
 	"os"
@@ -15,16 +15,26 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/dotcloud/docker/pkg/system"
+	"github.com/dotcloud/docker/utils"
+	"github.com/dotcloud/docker/vendor/src/code.google.com/p/go/src/pkg/archive/tar"
 )
 
-type Archive io.Reader
+type (
+	Archive       io.ReadCloser
+	ArchiveReader io.Reader
+	Compression   int
+	TarOptions    struct {
+		Includes    []string
+		Compression Compression
+		NoLchown    bool
+	}
+)
 
-type Compression int
-
-type TarOptions struct {
-	Includes    []string
-	Compression Compression
-}
+var (
+	ErrNotImplemented = errors.New("Function not implemented")
+)
 
 const (
 	Uncompressed Compression = iota
@@ -34,64 +44,47 @@ const (
 )
 
 func DetectCompression(source []byte) Compression {
-	sourceLen := len(source)
 	for compression, m := range map[Compression][]byte{
 		Bzip2: {0x42, 0x5A, 0x68},
 		Gzip:  {0x1F, 0x8B, 0x08},
 		Xz:    {0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00},
 	} {
-		fail := false
-		if len(m) > sourceLen {
+		if len(source) < len(m) {
 			utils.Debugf("Len too short")
 			continue
 		}
-		i := 0
-		for _, b := range m {
-			if b != source[i] {
-				fail = true
-				break
-			}
-			i++
-		}
-		if !fail {
+		if bytes.Compare(m, source[:len(m)]) == 0 {
 			return compression
 		}
 	}
 	return Uncompressed
 }
 
-func xzDecompress(archive io.Reader) (io.Reader, error) {
+func xzDecompress(archive io.Reader) (io.ReadCloser, error) {
 	args := []string{"xz", "-d", "-c", "-q"}
 
 	return CmdStream(exec.Command(args[0], args[1:]...), archive)
 }
 
-func DecompressStream(archive io.Reader) (io.Reader, error) {
-	buf := make([]byte, 10)
-	totalN := 0
-	for totalN < 10 {
-		n, err := archive.Read(buf[totalN:])
-		if err != nil {
-			if err == io.EOF {
-				return nil, fmt.Errorf("Tarball too short")
-			}
-			return nil, err
-		}
-		totalN += n
-		utils.Debugf("[tar autodetect] n: %d", n)
+func DecompressStream(archive io.Reader) (io.ReadCloser, error) {
+	buf := bufio.NewReader(archive)
+	bs, err := buf.Peek(10)
+	if err != nil {
+		return nil, err
 	}
-	compression := DetectCompression(buf)
-	wrap := io.MultiReader(bytes.NewReader(buf), archive)
+	utils.Debugf("[tar autodetect] n: %v", bs)
+
+	compression := DetectCompression(bs)
 
 	switch compression {
 	case Uncompressed:
-		return wrap, nil
+		return ioutil.NopCloser(buf), nil
 	case Gzip:
-		return gzip.NewReader(wrap)
+		return gzip.NewReader(buf)
 	case Bzip2:
-		return bzip2.NewReader(wrap), nil
+		return ioutil.NopCloser(bzip2.NewReader(buf)), nil
 	case Xz:
-		return xzDecompress(wrap)
+		return xzDecompress(buf)
 	default:
 		return nil, fmt.Errorf("Unsupported compression format %s", (&compression).Extension())
 	}
@@ -101,7 +94,7 @@ func CompressStream(dest io.WriteCloser, compression Compression) (io.WriteClose
 
 	switch compression {
 	case Uncompressed:
-		return dest, nil
+		return utils.NopWriteCloser(dest), nil
 	case Gzip:
 		return gzip.NewWriter(dest), nil
 	case Bzip2, Xz:
@@ -159,6 +152,13 @@ func addTarFile(path, name string, tw *tar.Writer) error {
 			hdr.Devmajor = int64(major(uint64(stat.Rdev)))
 			hdr.Devminor = int64(minor(uint64(stat.Rdev)))
 		}
+
+	}
+
+	capability, _ := system.Lgetxattr(path, "security.capability")
+	if capability != nil {
+		hdr.Xattrs = make(map[string]string)
+		hdr.Xattrs["security.capability"] = string(capability)
 	}
 
 	if err := tw.WriteHeader(hdr); err != nil {
@@ -180,20 +180,25 @@ func addTarFile(path, name string, tw *tar.Writer) error {
 	return nil
 }
 
-func createTarFile(path, extractDir string, hdr *tar.Header, reader *tar.Reader) error {
+func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, Lchown bool) error {
+	// hdr.Mode is in linux format, which we can use for sycalls,
+	// but for os.Foo() calls we need the mode converted to os.FileMode,
+	// so use hdrInfo.Mode() (they differ for e.g. setuid bits)
+	hdrInfo := hdr.FileInfo()
+
 	switch hdr.Typeflag {
 	case tar.TypeDir:
 		// Create directory unless it exists as a directory already.
 		// In that case we just want to merge the two
 		if fi, err := os.Lstat(path); !(err == nil && fi.IsDir()) {
-			if err := os.Mkdir(path, os.FileMode(hdr.Mode)); err != nil {
+			if err := os.Mkdir(path, hdrInfo.Mode()); err != nil {
 				return err
 			}
 		}
 
 	case tar.TypeReg, tar.TypeRegA:
 		// Source is regular file
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, os.FileMode(hdr.Mode))
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, hdrInfo.Mode())
 		if err != nil {
 			return err
 		}
@@ -236,14 +241,20 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader *tar.Reader)
 		return fmt.Errorf("Unhandled tar header type %d\n", hdr.Typeflag)
 	}
 
-	if err := syscall.Lchown(path, hdr.Uid, hdr.Gid); err != nil {
+	if err := os.Lchown(path, hdr.Uid, hdr.Gid); err != nil && Lchown {
 		return err
+	}
+
+	for key, value := range hdr.Xattrs {
+		if err := system.Lsetxattr(path, key, []byte(value), 0); err != nil {
+			return err
+		}
 	}
 
 	// There is no LChmod, so ignore mode for symlink. Also, this
 	// must happen after chown, as that can modify the file mode
 	if hdr.Typeflag != tar.TypeSymlink {
-		if err := syscall.Chmod(path, uint32(hdr.Mode&07777)); err != nil {
+		if err := os.Chmod(path, hdrInfo.Mode()); err != nil {
 			return err
 		}
 	}
@@ -251,11 +262,11 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader *tar.Reader)
 	ts := []syscall.Timespec{timeToTimespec(hdr.AccessTime), timeToTimespec(hdr.ModTime)}
 	// syscall.UtimesNano doesn't support a NOFOLLOW flag atm, and
 	if hdr.Typeflag != tar.TypeSymlink {
-		if err := syscall.UtimesNano(path, ts); err != nil {
+		if err := system.UtimesNano(path, ts); err != nil {
 			return err
 		}
 	} else {
-		if err := LUtimesNano(path, ts); err != nil {
+		if err := system.LUtimesNano(path, ts); err != nil {
 			return err
 		}
 	}
@@ -264,7 +275,7 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader *tar.Reader)
 
 // Tar creates an archive from the directory at `path`, and returns it as a
 // stream of bytes.
-func Tar(path string, compression Compression) (io.Reader, error) {
+func Tar(path string, compression Compression) (io.ReadCloser, error) {
 	return TarFilter(path, &TarOptions{Compression: compression})
 }
 
@@ -284,9 +295,12 @@ func escapeName(name string) string {
 	return string(escaped)
 }
 
-// Tar creates an archive from the directory at `path`, only including files whose relative
-// paths are included in `filter`. If `filter` is nil, then all files are included.
-func TarFilter(srcPath string, options *TarOptions) (io.Reader, error) {
+// TarFilter creates an archive from the directory at `srcPath` with `options`, and returns it as a
+// stream of bytes.
+//
+// Files are included according to `options.Includes`, default to including all files.
+// Stream is compressed according to `options.Compression', default to Uncompressed.
+func TarFilter(srcPath string, options *TarOptions) (io.ReadCloser, error) {
 	pipeReader, pipeWriter := io.Pipe()
 
 	compressWriter, err := CompressStream(pipeWriter, options.Compression)
@@ -332,6 +346,9 @@ func TarFilter(srcPath string, options *TarOptions) (io.Reader, error) {
 		if err := compressWriter.Close(); err != nil {
 			utils.Debugf("Can't close compress writer: %s\n", err)
 		}
+		if err := pipeWriter.Close(); err != nil {
+			utils.Debugf("Can't close pipe writer: %s\n", err)
+		}
 	}()
 
 	return pipeReader, nil
@@ -347,12 +364,13 @@ func Untar(archive io.Reader, dest string, options *TarOptions) error {
 		return fmt.Errorf("Empty archive")
 	}
 
-	archive, err := DecompressStream(archive)
+	decompressedArchive, err := DecompressStream(archive)
 	if err != nil {
 		return err
 	}
+	defer decompressedArchive.Close()
 
-	tr := tar.NewReader(archive)
+	tr := tar.NewReader(decompressedArchive)
 
 	var dirs []*tar.Header
 
@@ -375,7 +393,7 @@ func Untar(archive io.Reader, dest string, options *TarOptions) error {
 			parent := filepath.Dir(hdr.Name)
 			parentPath := filepath.Join(dest, parent)
 			if _, err := os.Lstat(parentPath); err != nil && os.IsNotExist(err) {
-				err = os.MkdirAll(parentPath, 600)
+				err = os.MkdirAll(parentPath, 0777)
 				if err != nil {
 					return err
 				}
@@ -389,14 +407,16 @@ func Untar(archive io.Reader, dest string, options *TarOptions) error {
 		// the layer is also a directory. Then we want to merge them (i.e.
 		// just apply the metadata from the layer).
 		if fi, err := os.Lstat(path); err == nil {
+			if fi.IsDir() && hdr.Name == "." {
+				continue
+			}
 			if !(fi.IsDir() && hdr.Typeflag == tar.TypeDir) {
 				if err := os.RemoveAll(path); err != nil {
 					return err
 				}
 			}
 		}
-
-		if err := createTarFile(path, dest, hdr, tr); err != nil {
+		if err := createTarFile(path, dest, hdr, tr, options == nil || !options.NoLchown); err != nil {
 			return err
 		}
 
@@ -427,15 +447,19 @@ func TarUntar(src string, dst string) error {
 	if err != nil {
 		return err
 	}
+	defer archive.Close()
 	return Untar(archive, dst, nil)
 }
 
 // UntarPath is a convenience function which looks for an archive
 // at filesystem path `src`, and unpacks it at `dst`.
 func UntarPath(src, dst string) error {
-	if archive, err := os.Open(src); err != nil {
+	archive, err := os.Open(src)
+	if err != nil {
 		return err
-	} else if err := Untar(archive, dst, nil); err != nil {
+	}
+	defer archive.Close()
+	if err := Untar(archive, dst, nil); err != nil {
 		return err
 	}
 	return nil
@@ -523,7 +547,7 @@ func CopyFileWithTar(src, dst string) (err error) {
 // CmdStream executes a command, and returns its stdout as a stream.
 // If the command fails to run or doesn't complete successfully, an error
 // will be returned, including anything written on stderr.
-func CmdStream(cmd *exec.Cmd, input io.Reader) (io.Reader, error) {
+func CmdStream(cmd *exec.Cmd, input io.Reader) (io.ReadCloser, error) {
 	if input != nil {
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
@@ -582,6 +606,9 @@ func NewTempArchive(src Archive, dir string) (*TempArchive, error) {
 		return nil, err
 	}
 	if _, err := io.Copy(f, src); err != nil {
+		return nil, err
+	}
+	if err = f.Sync(); err != nil {
 		return nil, err
 	}
 	if _, err := f.Seek(0, 0); err != nil {
